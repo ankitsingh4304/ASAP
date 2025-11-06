@@ -1,67 +1,79 @@
 const admin = require('firebase-admin');
 const logger = require('../utils/logger');
 const alertService = require('../services/alertService');
-const bpCalculationService = require('../services/bpCalculationService');
+
+let bpCalculationService = null;
+
+try {
+  bpCalculationService = require('../services/bpCalculationService');
+} catch (error) {
+  logger.error('Warning: Could not load BP calculation service:', error.message);
+}
 
 const db = admin.firestore();
 
-// ✅ NEW FUNCTION: Receive ECG + PPG data from ESP32
+// ✅ Receive ECG + PPG data from ESP32
 exports.receiveSensorData = async (req, res, next) => {
   try {
     const { userId, deviceId, ecg_signal, ppg_signal, timestamp } = req.body;
 
-    if (!userId || !ecg_signal || !ppg_signal) {
-      return res.status(400).json({
-        error: 'Missing required fields: userId, ecg_signal, ppg_signal'
-      });
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
     }
 
     if (!Array.isArray(ecg_signal) || !Array.isArray(ppg_signal)) {
-      return res.status(400).json({
-        error: 'ecg_signal and ppg_signal must be arrays'
+      return res.status(400).json({ 
+        error: 'ecg_signal and ppg_signal must be arrays' 
       });
     }
 
-    logger.info(`📡 Sensor data received from device ${deviceId} for user ${userId}`);
-    logger.info(`   ECG samples: ${ecg_signal.length}, PPG samples: ${ppg_signal.length}`);
+    if (ecg_signal.length === 0 || ppg_signal.length === 0) {
+      return res.status(400).json({ 
+        error: 'ecg_signal and ppg_signal cannot be empty' 
+      });
+    }
 
-    // Store raw sensor data
+    logger.info(`📡 Sensor data received from ${deviceId || 'unknown'} for user ${userId}`);
+
     const sensorDataRef = await db.collection('sensor_data_raw').add({
       userId,
       deviceId: deviceId || 'ESP32_DEFAULT',
-      ecg_signal,
-      ppg_signal,
+      ecg_signal: ecg_signal.slice(0, 1000),
+      ppg_signal: ppg_signal.slice(0, 1000),
       timestamp: timestamp ? new Date(timestamp) : admin.firestore.FieldValue.serverTimestamp(),
       processed: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    logger.info(`✅ Raw sensor data stored with ID: ${sensorDataRef.id}`);
+    logger.info(`✅ Raw sensor data stored: ${sensorDataRef.id}`);
 
     res.json({
       status: 'success',
       sensorDataId: sensorDataRef.id,
-      message: 'Sensor data received. Will be processed for BP calculation.',
-      ecgSamples: ecg_signal.length,
-      ppgSamples: ppg_signal.length
+      message: 'Sensor data received'
     });
   } catch (error) {
     logger.error('Receive sensor data error:', error.message);
-    next(error);
+    res.status(500).json({ error: error.message });
   }
 };
 
-// ✅ NEW FUNCTION: Calculate BP from signals (called by scheduler every 1 minute)
-exports.calculateAndStoreBP = async (userId, ecgSignal, ppgSignal) => {
+// ✅ Calculate BP and store (with AGE-BASED constants)
+exports.calculateAndStoreBP = async (userId, ecgSignal, ppgSignal, userAge = 40) => {
   try {
-    logger.info(`🔢 Calculating BP for user ${userId} (ECG: ${ecgSignal.length} samples, PPG: ${ppgSignal.length} samples)`);
+    logger.info(`🔢 Calculating BP for user ${userId} (Age: ${userAge})`);
 
-    // Call your BP calculation service
-    const bpResult = await bpCalculationService.calculateBP(ecgSignal, ppgSignal);
+    if (!bpCalculationService) {
+      throw new Error('BP calculation service not available');
+    }
 
-    logger.info(`📊 BP Calculation Result: Systolic=${bpResult.systolic}, Diastolic=${bpResult.diastolic}, HR=${bpResult.heart_rate}`);
+    // Call BP calculation with age parameter
+    const bpResult = await bpCalculationService.calculateBP(
+      ecgSignal, 
+      ppgSignal, 
+      userAge  // ← Pass age for age-based constants
+    );
 
-    // Store in Firestore
     const bpData = {
       userId,
       ecg_signal: ecgSignal,
@@ -71,12 +83,15 @@ exports.calculateAndStoreBP = async (userId, ecgSignal, ppgSignal) => {
       map: bpResult.map,
       heart_rate: bpResult.heart_rate,
       confidence: bpResult.confidence,
+      ptt: bpResult.ptt,
+      age_used: userAge,
+      formula_type: 'age-based-ptt',
       timestamp: admin.firestore.FieldValue.serverTimestamp()
     };
 
     const docRef = await db.collection('bp_readings').add(bpData);
 
-    logger.info(`✅ BP stored in Firestore: ${bpResult.systolic}/${bpResult.diastolic} mmHg, HR: ${bpResult.heart_rate} bpm`);
+    logger.info(`✅ BP stored: ${bpResult.systolic}/${bpResult.diastolic} mmHg (Age: ${userAge}, PTT: ${bpResult.ptt.toFixed(2)}ms)`);
 
     // Check for abnormalities
     const alert = await alertService.checkAbnormality(
@@ -84,7 +99,7 @@ exports.calculateAndStoreBP = async (userId, ecgSignal, ppgSignal) => {
       bpResult.systolic,
       bpResult.diastolic,
       bpResult.heart_rate,
-      null // SpO2 not available from ECG+PPG only
+      null
     );
 
     if (alert) {
@@ -99,7 +114,7 @@ exports.calculateAndStoreBP = async (userId, ecgSignal, ppgSignal) => {
   }
 };
 
-// EXISTING FUNCTIONS (keep all these)
+// ✅ Receive manual BP data (for testing without sensors)
 exports.receiveBPData = async (req, res, next) => {
   return await exports.receiveBPDataSim(req, res, next);
 };
@@ -112,7 +127,7 @@ exports.receiveBPDataSim = async (req, res, next) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    logger.info(`📊 BP data received: ${systolic}/${diastolic} for user ${userId}`);
+    logger.info(`📊 BP data received: ${systolic}/${diastolic}`);
 
     const readingData = {
       userId,
@@ -126,16 +141,12 @@ exports.receiveBPDataSim = async (req, res, next) => {
     const docRef = await db.collection('bp_readings').add(readingData);
 
     const alert = await alertService.checkAbnormality(
-      userId,
-      systolic,
-      diastolic,
-      heart_rate,
+      userId, 
+      systolic, 
+      diastolic, 
+      heart_rate, 
       spo2
     );
-
-    if (alert) {
-      logger.warn(`⚠️ ALERT TRIGGERED: ${alert.type}`);
-    }
 
     res.json({
       status: 'success',
@@ -152,16 +163,21 @@ exports.receiveBPDataSim = async (req, res, next) => {
   }
 };
 
+// ✅ Get BP history for a user
 exports.getBPHistory = async (req, res, next) => {
   try {
     const { userId } = req.params;
     const { limit = 20 } = req.query;
 
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+
     const snapshot = await db
       .collection('bp_readings')
       .where('userId', '==', userId)
       .orderBy('timestamp', 'desc')
-      .limit(parseInt(limit))
+      .limit(parseInt(limit) || 20)
       .get();
 
     const readings = [];
@@ -169,9 +185,12 @@ exports.getBPHistory = async (req, res, next) => {
       readings.push({ id: doc.id, ...doc.data() });
     });
 
-    res.json({
-      count: readings.length,
-      readings
+    logger.info(`✅ Retrieved ${readings.length} BP readings for user ${userId}`);
+
+    res.json({ 
+      count: readings.length, 
+      readings,
+      userId 
     });
   } catch (error) {
     logger.error('Get BP history error:', error.message);
@@ -179,9 +198,14 @@ exports.getBPHistory = async (req, res, next) => {
   }
 };
 
+// ✅ Get latest BP reading
 exports.getLatestBP = async (req, res, next) => {
   try {
     const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
 
     const snapshot = await db
       .collection('bp_readings')
@@ -191,21 +215,31 @@ exports.getLatestBP = async (req, res, next) => {
       .get();
 
     if (snapshot.empty) {
+      logger.info(`ℹ️ No BP readings found for user ${userId}`);
       return res.json({ reading: null });
     }
 
     const doc = snapshot.docs[0];
-    res.json({ reading: { id: doc.id, ...doc.data() } });
+    logger.info(`✅ Latest BP for user ${userId}: ${doc.data().systolic_bp}/${doc.data().diastolic_bp}`);
+
+    res.json({ 
+      reading: { id: doc.id, ...doc.data() } 
+    });
   } catch (error) {
     logger.error('Get latest BP error:', error.message);
     next(error);
   }
 };
 
+// ✅ Get BP statistics for a user
 exports.getBPStats = async (req, res, next) => {
   try {
     const { userId } = req.params;
     const { days = 7 } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
 
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - parseInt(days));
@@ -217,32 +251,61 @@ exports.getBPStats = async (req, res, next) => {
       .get();
 
     if (snapshot.empty) {
-      return res.json({ error: 'No BP data' });
+      logger.info(`ℹ️ No BP data for user ${userId} in last ${days} days`);
+      return res.json({ error: 'No BP data', reading_count: 0 });
     }
 
-    let totalSystolic = 0, totalDiastolic = 0;
-    let minSystolic = Infinity, maxSystolic = 0;
+    let totalSystolic = 0;
+    let totalDiastolic = 0;
+    let minSystolic = Infinity;
+    let maxSystolic = 0;
+    let minDiastolic = Infinity;
+    let maxDiastolic = 0;
+    let totalHR = 0;
+    let hrCount = 0;
 
     snapshot.forEach(doc => {
       const data = doc.data();
-      totalSystolic += data.systolic_bp || data.systolic || 0;
-      totalDiastolic += data.diastolic_bp || data.diastolic || 0;
-      minSystolic = Math.min(minSystolic, data.systolic_bp || data.systolic || 0);
-      maxSystolic = Math.max(maxSystolic, data.systolic_bp || data.systolic || 0);
+      
+      const sys = data.systolic_bp || data.systolic || 0;
+      const dias = data.diastolic_bp || data.diastolic || 0;
+      
+      totalSystolic += sys;
+      totalDiastolic += dias;
+      minSystolic = Math.min(minSystolic, sys);
+      maxSystolic = Math.max(maxSystolic, sys);
+      minDiastolic = Math.min(minDiastolic, dias);
+      maxDiastolic = Math.max(maxDiastolic, dias);
+
+      if (data.heart_rate) {
+        totalHR += data.heart_rate;
+        hrCount++;
+      }
     });
 
     const count = snapshot.size;
+    const avgHR = hrCount > 0 ? Math.round(totalHR / hrCount) : 0;
 
-    res.json({
+    const stats = {
       average_systolic: (totalSystolic / count).toFixed(1),
       average_diastolic: (totalDiastolic / count).toFixed(1),
-      min_systolic: minSystolic,
+      min_systolic: minSystolic === Infinity ? 0 : minSystolic,
       max_systolic: maxSystolic,
+      min_diastolic: minDiastolic === Infinity ? 0 : minDiastolic,
+      max_diastolic: maxDiastolic,
+      average_heart_rate: avgHR,
       reading_count: count,
-      period_days: days
-    });
+      period_days: days,
+      userId
+    };
+
+    logger.info(`✅ BP stats for user ${userId} (${days} days): Avg ${stats.average_systolic}/${stats.average_diastolic}`);
+
+    res.json(stats);
   } catch (error) {
     logger.error('Get BP stats error:', error.message);
     next(error);
   }
 };
+
+module.exports = exports;
