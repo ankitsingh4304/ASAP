@@ -1,11 +1,8 @@
-const log = (level, message) => {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] [${level}] ${message}`);
+const logger = {
+  info: (message) => console.log(`[${new Date().toISOString()}] [INFO] ${message}`),
+  warn: (message) => console.warn(`[${new Date().toISOString()}] [WARN] ${message}`),
+  error: (message, error) => console.error(`[${new Date().toISOString()}] [ERROR] ${message}`, error || ''),
+  debug: (message) => console.log(`[${new Date().toISOString()}] [DEBUG] ${message}`)
 };
 
-module.exports = {
-  info: (msg) => log('INFO', msg),
-  error: (msg) => log('ERROR', msg),
-  warn: (msg) => log('WARN', msg),
-  debug: (msg) => log('DEBUG', msg)
-};
+module.exports = logger;
