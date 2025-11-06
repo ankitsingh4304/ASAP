@@ -1,30 +1,35 @@
 const admin = require('firebase-admin');
 const logger = require('../utils/logger');
-const bpController = require('../controllers/bpController');
 
-const db = admin.firestore();
+let processingInProgress = false;
 
-// ✅ Start the scheduler
 exports.startBPProcessingScheduler = () => {
   logger.info('🔄 BP Processing Scheduler started (runs every 1 minute)');
 
-  // Run immediately on startup
+  // Run immediately
   processUnprocessedSensorData();
 
-  // Then run every 60 seconds
+  // Then every 60 seconds
   setInterval(() => {
     processUnprocessedSensorData();
-  }, 60 * 1000); // 60 seconds
+  }, 60 * 1000);
 };
 
-// ✅ Process unprocessed sensor data
 async function processUnprocessedSensorData() {
   try {
+    // Prevent concurrent processing
+    if (processingInProgress) {
+      logger.warn('⚠️ [BP SCHEDULER] Processing already in progress, skipping this cycle');
+      return;
+    }
+
+    processingInProgress = true;
+
     logger.info('📊 [BP SCHEDULER] Checking for unprocessed sensor data...');
 
-    // Get all unprocessed sensor data from last 5 minutes
+    const db = admin.firestore();
     const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-
+    
     const snapshot = await db
       .collection('sensor_data_raw')
       .where('processed', '==', false)
@@ -34,12 +39,12 @@ async function processUnprocessedSensorData() {
 
     if (snapshot.empty) {
       logger.info('📊 [BP SCHEDULER] No unprocessed sensor data found');
+      processingInProgress = false;
       return;
     }
 
     logger.info(`📊 [BP SCHEDULER] Found ${snapshot.size} unprocessed sensor records`);
 
-    // Group by userId
     const userDataMap = {};
 
     snapshot.forEach(doc => {
@@ -52,11 +57,17 @@ async function processUnprocessedSensorData() {
         };
       }
       userDataMap[data.userId].records.push({ docId: doc.id, data });
-      userDataMap[data.userId].allECG.push(...(data.ecg_signal || []));
-      userDataMap[data.userId].allPPG.push(...(data.ppg_signal || []));
+      
+      if (Array.isArray(data.ecg_signal)) {
+        userDataMap[data.userId].allECG.push(...data.ecg_signal);
+      }
+      if (Array.isArray(data.ppg_signal)) {
+        userDataMap[data.userId].allPPG.push(...data.ppg_signal);
+      }
     });
 
-    // Process each user's data
+    const bpController = require('../controllers/bpController');
+
     for (const userId in userDataMap) {
       try {
         const userData = userDataMap[userId];
@@ -66,18 +77,23 @@ async function processUnprocessedSensorData() {
           continue;
         }
 
-        logger.info(`🔢 [BP SCHEDULER] Calculating BP for user ${userId} (${userData.allECG.length} ECG samples, ${userData.allPPG.length} PPG samples)`);
+        // ✅ FETCH USER'S AGE FROM DATABASE
+        const userDoc = await db.collection('users').doc(userId).get();
+        const userAge = userDoc.exists ? (userDoc.data().age || 40) : 40;
 
-        // Calculate BP
+        logger.info(`🔢 [BP SCHEDULER] Calculating BP for user ${userId} (Age: ${userAge})`);
+
+        // ✅ PASS AGE TO CALCULATION
         const result = await bpController.calculateAndStoreBP(
           userId,
           userData.allECG,
-          userData.allPPG
+          userData.allPPG,
+          userAge  // ← Pass age here
         );
 
-        logger.info(`✅ [BP SCHEDULER] BP calculated for ${userId}: ${result.bpData.systolic_bp}/${result.bpData.diastolic_bp} mmHg, Status: ${result.status}`);
+        logger.info(`✅ [BP SCHEDULER] BP: ${result.bpData.systolic_bp}/${result.bpData.diastolic_bp} mmHg`);
 
-        // Mark all records as processed
+        // Mark as processed
         for (const record of userData.records) {
           await db.collection('sensor_data_raw').doc(record.docId).update({
             processed: true,
@@ -85,10 +101,8 @@ async function processUnprocessedSensorData() {
           });
         }
 
-        logger.info(`📝 [BP SCHEDULER] Marked ${userData.records.length} records as processed for user ${userId}`);
-
       } catch (userError) {
-        logger.error(`❌ [BP SCHEDULER] Error processing user ${userId}:`, userError.message);
+        logger.error(`❌ [BP SCHEDULER] Error for user ${userId}:`, userError.message);
       }
     }
 
@@ -96,6 +110,8 @@ async function processUnprocessedSensorData() {
 
   } catch (error) {
     logger.error('❌ [BP SCHEDULER] Scheduler error:', error.message);
+  } finally {
+    processingInProgress = false;
   }
 }
 
